@@ -6,15 +6,13 @@ from stable_baselines3.common.evaluation import evaluate_policy
 from stable_baselines3.common.vec_env import DummyVecEnv
 from stable_baselines3.common.noise import NormalActionNoise
 
-import mujoco  # <-- IMPORTANT: for mj_forward
+import mujoco 
 
 ENV_ID = "Pusher-v5"
 MODEL_PATH = "sac_pusher_random_goal.zip"
 
-
 # --------- helper: sample random goal in workspace ---------
 def generate_random_goalpoint():
-    # Your previous logic: sample in region x^2 + y^2 <= 1, y in [-0.5, 0.5]
     x = 10.0
     y = 10.0
     while x**2 + y**2 > 1.0:

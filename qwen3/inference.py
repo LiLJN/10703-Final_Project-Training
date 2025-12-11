@@ -1,278 +1,210 @@
 #!/usr/bin/env python3
+import os
 import re
+import csv
 from pathlib import Path
 
-import gymnasium as gym
-import numpy as np
-from PIL import Image
 import torch
+from PIL import Image
 
-from transformers import Qwen3VLForConditionalGeneration, AutoProcessor
+from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
 from peft import PeftModel
 
-# -------------------------
-# Paths & basic config
-# -------------------------
-THIS_DIR = Path(__file__).resolve().parent
-ROOT_DIR = THIS_DIR.parent
+# ================== CONFIG ==================
+FRAMES_DIR = "expert_frames"               # folder with frame_00000.png, frame_00001.png, ...
+OUTPUT_CSV = "predicted_rewards.csv"       # CSV: index, prev_frame, curr_frame, predicted_reward
+OUTPUT_TXT = "predicted_rewards.txt"       # TXT: one reward per line
 
-LORA_DIR = ROOT_DIR / "qwen3_vl_pusher_lora" 
+BASE_MODEL_NAME = "Qwen/Qwen3-VL-8B-Instruct"
+LORA_PATH = "qwen3_vl_pusher_lora"
 
-BASE_MODEL_ID = "Qwen/Qwen3-VL-8B-Instruct"
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+DTYPE = torch.bfloat16 if torch.cuda.is_available() else torch.float32
 
-ENV_ID = "Pusher-v5"
-NUM_EPISODES = 2
-MAX_STEPS_PER_EP = 200
-MAX_SAMPLES = 200  # max (true, pred) pairs; set None for unlimited
-
-
-# Messages copied from your *new* dataset format
-SYSTEM_TEXT = (
-    "You are a VLM that takes 2 consecutive frames from the 'Pusher-V5' "
-    "environment and generate rewards base on them."
-)
-
-USER_TEXT = (
-    "The first image shows the scene at the previous time step; the second image "
-    "shows the scene at the current time step. From these two images, estimate the "
-    "immediate reward at the current time step. Please output a single float number."
-)
+# Optional: HF token if needed (or rely on `huggingface-cli login`)
+HF_TOKEN = os.getenv("HF_TOKEN", None)
+# ===========================================
 
 
-# -------------------------
-# Utils
-# -------------------------
-def get_device() -> str:
-    # if torch.backends.mps.is_available():
-    #     return "mps"
-    return "cpu"
+def natural_key(s: str):
+    """Sort strings with embedded numbers: frame_1, frame_2, ..., frame_10."""
+    return [int(text) if text.isdigit() else text.lower()
+            for text in re.split(r"(\d+)", s)]
 
 
-def pil_from_array(arr: np.ndarray) -> Image.Image:
-    return Image.fromarray(arr.astype(np.uint8)).convert("RGB")
+def list_image_files(folder: str):
+    """Return sorted list of image file paths from the folder."""
+    exts = {".png", ".jpg", ".jpeg", ".bmp", ".webp"}
+    files = [f for f in os.listdir(folder) if Path(f).suffix.lower() in exts]
+    files.sort(key=natural_key)
+    return [os.path.join(folder, f) for f in files]
 
 
-def parse_reward(raw: str):
-    raw = raw.strip()
-    # try direct float
-    try:
-        return float(raw)
-    except ValueError:
-        pass
-    # fallback: first float substring
-    m = re.search(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?", raw)
-    if m:
-        try:
-            return float(m.group(0))
-        except ValueError:
-            pass
-    return None
+def extract_first_float(text: str) -> float:
+    """Extract the first float from model output."""
+    match = re.search(r"-?\d+(\.\d+)?", text)
+    if not match:
+        raise ValueError(f"Could not find a numeric reward in model output: {text!r}")
+    return float(match.group(0))
 
-# -------------------------
-# Model loading
-# -------------------------
+
 def load_model_and_processor():
-    device = get_device()
-    print(f"[INFO] Using device: {device}")
-    print(f"[INFO] Base model: {BASE_MODEL_ID}")
-    print(f"[INFO] LoRA dir:   {LORA_DIR}")
-
-    if not LORA_DIR.is_dir():
-        raise FileNotFoundError(f"LoRA directory not found: {LORA_DIR}")
-
-    print("[INFO] Loading base Qwen3-VL model...")
-    model = Qwen3VLForConditionalGeneration.from_pretrained(
-        BASE_MODEL_ID,
-        torch_dtype=torch.float32,   # CPU / MPS friendly
-        trust_remote_code=True,
-    )
-
-    print("[INFO] Loading LoRA adapter into base model...")
-    model = PeftModel.from_pretrained(
-        model,
-        LORA_DIR,
-        is_trainable=False,
-        device_map=None,
-    )
-
-    model.to(device)
-    model.eval()
-
-    print("[INFO] Loading processor (tokenizer + vision + chat template)...")
-    # Use LORA_DIR so we pick up your chat_template.jinja if saved there
+    print(f"Loading processor from: {BASE_MODEL_NAME}")
     processor = AutoProcessor.from_pretrained(
-        LORA_DIR,
+        BASE_MODEL_NAME,
         trust_remote_code=True,
+        token=HF_TOKEN,
     )
 
-    return model, processor, device
+    print(f"Loading base Qwen3-VL model from: {BASE_MODEL_NAME}")
+    # IMPORTANT: no device_map="auto" here
+    base_model = Qwen3VLForConditionalGeneration.from_pretrained(
+        BASE_MODEL_NAME,
+        torch_dtype=DTYPE,
+        device_map=None,
+        trust_remote_code=True,
+        token=HF_TOKEN,
+    )
+
+    print(f"Loading LoRA adapter from: {LORA_PATH}")
+    # Load LoRA weights onto the plain base_model (no offload, no device_map)
+    model = PeftModel.from_pretrained(
+        base_model,
+        LORA_PATH,
+        is_trainable=False,
+    )
+
+    model.to(DEVICE)
+    model.eval()
+    return model, processor
 
 
-# -------------------------
-# Inference on two frames
-# -------------------------
-@torch.no_grad()
-def predict_reward_from_two_frames(
-    model,
-    processor,
-    device: str,
-    prev_pil: Image.Image,
-    curr_pil: Image.Image,
-    max_new_tokens: int = 32,
-):
+def build_messages():
     """
-    Use fine-tuned Qwen3-VL + LoRA to predict reward from 2 frames.
-    Mirrors your new dataset messages, but uses:
-      1) apply_chat_template -> text prompt
-      2) processor(text, images=...) -> model inputs (dict of tensors)
+    Match your fine-tuning format:
+
+    {"messages": [
+      {"role": "system", "content":[{"type":"text","text": "..."}]},
+      {"role": "user",   "content":[
+           {"type":"image"},
+           {"type":"image"},
+           {"type":"text","text": "..."}
+      ]}
+    ]}
     """
-    # 1) Build messages exactly like in your new dataset (but with PIL images)
+    system_text = (
+        "You are a VLM that takes 2 consecutive frames from the 'Pusher-V5' "
+        "environment and generate rewards base on them."
+    )
+    user_instruction = (
+        "The first image shows the scene at the previous time step; "
+        "the second image shows the scene at the current time step. "
+        "From these two images, estimate the immediate reward at the current time step. "
+        "Please output a single float number."
+    )
+
     messages = [
         {
             "role": "system",
             "content": [
-                {
-                    "type": "text",
-                    "text": "You are a VLM that takes 2 consecutive frames from the 'Pusher-V5' environment and generate rewards base on them.",
-                }
+                {"type": "text", "text": system_text}
             ],
         },
         {
             "role": "user",
             "content": [
-                {"type": "image", "image": "<image_1>"},
-                {"type": "image", "image": "<image_2>"},
-                {
-                    "type": "text",
-                    "text": (
-                        "The first image shows the scene at the previous time step; "
-                        "the second image shows the scene at the current time step. "
-                        "From these two images, estimate the immediate reward at the "
-                        "current time step. Please output a single float number."
-                    ),
-                },
+                {"type": "image"},  # first frame (previous timestep)
+                {"type": "image"},  # second frame (current timestep)
+                {"type": "text", "text": user_instruction},
             ],
         },
     ]
+    return messages
 
-    # 2) Turn messages into a *text* prompt using the chat template
-    prompt_text = processor.apply_chat_template(
+
+def predict_reward_for_pair(model, processor, img_prev_path: str, img_curr_path: str) -> float:
+    img_prev = Image.open(img_prev_path).convert("RGB")
+    img_curr = Image.open(img_curr_path).convert("RGB")
+
+    messages = build_messages()
+
+    # Turn chat messages into text prompt
+    chat_text = processor.apply_chat_template(
         messages,
-        tokenize=False,              # <- IMPORTANT: we want a string, not tensors
+        tokenize=False,
         add_generation_prompt=True,
     )
 
-    # 3) Build model inputs from text + images
-    #    Qwen3-VL processor handles multi-image inputs like this:
+    # Prepare inputs (text + 2 images)
     inputs = processor(
-        text=prompt_text,
-        images=[prev_pil, curr_pil],  # 2 consecutive frames
-        return_tensors="pt",
-    )
+        text=[chat_text],
+        images=[img_prev, img_curr],
+        return_tensors="pt"
+    ).to(DEVICE)
 
-    inputs = {k: v.to(device) for k, v in inputs.items()}
+    with torch.no_grad():
+        generated_ids = model.generate(
+            **inputs,
+            max_new_tokens=16,
+            do_sample=False,
+        )
 
-    # 4) Generate
-    generated_ids = model.generate(
-        **inputs,
-        max_new_tokens=max_new_tokens,
-        do_sample=False,
-        temperature=0.0,
-        use_cache=True,
-    )
-
-    # 5) Decode ONLY the newly generated tokens
-    input_len = inputs["input_ids"].shape[1]
-    new_tokens = generated_ids[:, input_len:]
-
-    raw_text = processor.batch_decode(
-        new_tokens,
-        skip_special_tokens=True,
-        clean_up_tokenization_spaces=False,
+    # Decode output text and extract numeric reward
+    text_out = processor.batch_decode(
+        generated_ids,
+        skip_special_tokens=True
     )[0].strip()
 
-    val = parse_reward(raw_text)
-    return raw_text, val
+    reward = extract_first_float(text_out)
+    return reward
 
 
-# -------------------------
-# Main rollout loop
-# -------------------------
 def main():
-    model, processor, device = load_model_and_processor()
+    # 1) Collect frames
+    frame_paths = list_image_files(FRAMES_DIR)
+    if len(frame_paths) < 2:
+        raise RuntimeError(f"Need at least 2 images in {FRAMES_DIR}, found {len(frame_paths)}")
 
-    print(f"[ENV] Creating env: {ENV_ID}")
-    env = gym.make(ENV_ID, render_mode="rgb_array")
+    print(f"Found {len(frame_paths)} frames in '{FRAMES_DIR}'")
 
-    all_true = []
-    all_pred = []
-    samples_used = 0
+    # 2) Load model + processor
+    model, processor = load_model_and_processor()
 
-    for ep in range(NUM_EPISODES):
-        obs, info = env.reset()
-        frame_prev = env.render()
-        step = 0
+    # 3) Predict rewards for consecutive frame pairs
+    rows = []
+    rewards_only = []
+    for i in range(len(frame_paths) - 1):
+        img_prev = frame_paths[i]
+        img_curr = frame_paths[i + 1]
 
-        print(f"\n=== Episode {ep} ===")
+        print(f"[{i}] {os.path.basename(img_prev)} -> {os.path.basename(img_curr)}")
+        reward = predict_reward_for_pair(model, processor, img_prev, img_curr)
+        print(f"    Predicted reward: {reward:.6f}")
 
-        while step < MAX_STEPS_PER_EP:
-            action = env.action_space.sample()
-            obs, reward, terminated, truncated, info = env.step(action)
-            frame_curr = env.render()
-            step += 1
+        rows.append({
+            "index": i,
+            "prev_frame": os.path.basename(img_prev),
+            "curr_frame": os.path.basename(img_curr),
+            "predicted_reward": reward,
+        })
+        rewards_only.append(reward)
 
-            prev_pil = pil_from_array(frame_prev)
-            curr_pil = pil_from_array(frame_curr)
+    # 4) Save CSV
+    print(f"Writing predictions to {OUTPUT_CSV}")
+    with open(OUTPUT_CSV, "w", newline="") as f:
+        writer = csv.DictWriter(
+            f, fieldnames=["index", "prev_frame", "curr_frame", "predicted_reward"]
+        )
+        writer.writeheader()
+        writer.writerows(rows)
 
-            raw, pred_reward = predict_reward_from_two_frames(
-                model, processor, device, prev_pil, curr_pil
-            )
+    # 5) Save TXT (just rewards)
+    print(f"Writing rewards to {OUTPUT_TXT}")
+    with open(OUTPUT_TXT, "w") as f:
+        for r in rewards_only:
+            f.write(f"{r}\n")
 
-            if pred_reward is not None:
-                all_true.append(float(reward))
-                all_pred.append(float(pred_reward))
-                samples_used += 1
-                print(
-                    f"step={step:3d} | true={reward: .4f} | pred={pred_reward: .4f} | raw='{raw}'"
-                )
-            else:
-                print(
-                    f"step={step:3d} | true={reward: .4f} | pred=None | raw='{raw}'"
-                )
-
-            frame_prev = frame_curr
-
-            if MAX_SAMPLES is not None and samples_used >= MAX_SAMPLES:
-                break
-
-            if terminated or truncated:
-                break
-
-        if MAX_SAMPLES is not None and samples_used >= MAX_SAMPLES:
-            break
-
-    env.close()
-
-    if not all_true:
-        print("\n[RESULT] No valid scalar predictions parsed. "
-              "Check raw outputs above.")
-        return
-
-    y_true = np.array(all_true, dtype=np.float64)
-    y_pred = np.array(all_pred, dtype=np.float64)
-
-    mse = np.mean((y_true - y_pred) ** 2)
-    mae = np.mean(np.abs(y_true - y_pred))
-    corr = float("nan")
-    if len(y_true) > 1:
-        corr = float(np.corrcoef(y_true, y_pred)[0, 1])
-
-    print("\n========= SUMMARY (env rollouts) =========")
-    print(f"# samples (scalar preds): {len(y_true)}")
-    print(f"MSE:  {mse:.6f}")
-    print(f"MAE:  {mae:.6f}")
-    print(f"Corr: {corr:.4f}")
-    print("==========================================")
+    print("Done.")
 
 
 if __name__ == "__main__":

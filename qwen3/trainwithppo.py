@@ -83,7 +83,7 @@ def main():
     print(f"[PPO] Mean reward (random goals): {mean_reward:.2f}")
 
     model.save(MODEL_PATH)
-    print(f"Saved TD3 model to {MODEL_PATH}")
+    print(f"Saved PPO model to {MODEL_PATH}")
 
 if __name__ == "__main__":
     main()
